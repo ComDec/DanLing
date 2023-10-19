@@ -120,10 +120,10 @@ class BaseRunner(metaclass=RunnerMeta):
     _mode: RunnerMode
     state: RunnerState
 
-    model: Callable | None = None
-    criterion: Callable | None = None
-    optimizer: Any | None = None
-    scheduler: Any | None = None
+    _model: Callable | None = None
+    _criterion: Callable | None = None
+    _optimizer: Any | None = None
+    _scheduler: Any | None = None
 
     datasets: FlatDict
     datasamplers: FlatDict
@@ -135,17 +135,16 @@ class BaseRunner(metaclass=RunnerMeta):
     writer: Any | None = None
 
     def __init__(self, config: NestedDict) -> None:
-        if "datasets" not in self.__dict__:
-            self.datasets = FlatDict()
-        if "datasamplers" not in self.__dict__:
-            self.datasamplers = FlatDict()
-        if "dataloaders" not in self.__dict__:
-            self.dataloaders = FlatDict()
         self._mode = RunnerMode.train
+        self.datasets = FlatDict()
+        self.datasamplers = FlatDict()
+        self.dataloaders = FlatDict()
         self.meters = AverageMeters()
         self.metrics = None
         # must init state at last to avoid conflict names
         self.state = RunnerState(config)
+
+    def __post_init__(self, *args, **kwargs) -> None:
         self.init_distributed()
         if self.state.seed is not None:
             self.set_seed()
@@ -159,12 +158,9 @@ class BaseRunner(metaclass=RunnerMeta):
             )
         if self.state.log:
             self.init_logging()
-        self.init_print()
         if self.state.tensorboard:
             self.init_tensorboard()
-
-    def __post_init__(self, *args, **kwargs) -> None:
-        pass
+        self.init_print()
 
     @property
     def mode(self) -> RunnerMode:
@@ -177,6 +173,38 @@ class BaseRunner(metaclass=RunnerMeta):
         self._mode = mode
         if self.model is not None:
             self.model.train(mode == RunnerMode.train)  # type: ignore
+
+    @property
+    def model(self) -> Any:
+        return self._model
+
+    @model.setter
+    def model(self, model: Any) -> None:
+        self._model = model
+
+    @property
+    def criterion(self) -> Any:
+        return self._criterion
+
+    @criterion.setter
+    def criterion(self, criterion: Any) -> None:
+        self._criterion = criterion
+
+    @property
+    def optimizer(self) -> Any:
+        return self._optimizer
+
+    @optimizer.setter
+    def optimizer(self, optimizer: Any) -> None:
+        self._optimizer = optimizer
+
+    @property
+    def scheduler(self) -> Any:
+        return self._scheduler
+
+    @scheduler.setter
+    def scheduler(self, scheduler: Any) -> None:
+        self._scheduler = scheduler
 
     @cached_property
     def batch_size(self) -> int:
@@ -191,7 +219,7 @@ class BaseRunner(metaclass=RunnerMeta):
             (int):
         """
 
-        batch_size = self.state.get("dataloader.batch_size")
+        batch_size = self.state.get("batch_size")
         if batch_size:
             return batch_size
         if self.dataloaders:
@@ -211,6 +239,17 @@ class BaseRunner(metaclass=RunnerMeta):
         return self.batch_size * self.world_size * self.accum_steps
 
     @cached_property
+    def accum_steps(self) -> int:
+        r"""
+        Gradient accumulation steps.
+
+        Returns:
+            (int):
+        """
+
+        return self.state.get("accum_steps", 1)
+
+    @cached_property
     def total_epochs(self) -> int:
         if self.state.epoch_end:
             return self.state.epoch_end - self.state.epoch_begin
@@ -222,17 +261,6 @@ class BaseRunner(metaclass=RunnerMeta):
             return self.state.step_end - self.state.step_begin
         dataset = self.datasets.get("train", next(iter(self.datasets.values())))
         return self.total_epochs * ceil(len(dataset) / self.batch_size)
-
-    @cached_property
-    def accum_steps(self) -> int:
-        r"""
-        Accumulated steps.
-
-        Returns:
-            (int):
-        """
-
-        return self.state.get("accum_steps", 1)
 
     def init_distributed(self) -> None:
         r"""
@@ -255,7 +283,7 @@ class BaseRunner(metaclass=RunnerMeta):
         Number of processes.
         """
 
-        return 1
+        return int(os.environ.get("WORLD_SIZE", 1))
 
     @property
     def rank(self) -> int:
@@ -263,7 +291,7 @@ class BaseRunner(metaclass=RunnerMeta):
         Process index of all processes.
         """
 
-        return 0
+        return int(os.environ.get("RANK", -1))
 
     @property
     def local_rank(self) -> int:
@@ -271,7 +299,7 @@ class BaseRunner(metaclass=RunnerMeta):
         Process index of local processes.
         """
 
-        return 0
+        return int(os.environ.get("LOCAL_RANK", -1))
 
     @property
     def distributed(self) -> bool:
@@ -640,84 +668,6 @@ class BaseRunner(metaclass=RunnerMeta):
         lines = "\n".join(lines)
         lines = first + "\n" + lines
         return lines
-
-    def init_deepspeed(self, config: dict | None = None) -> dict:  # type: ignore # pylint: disable=R0912,R0915
-        r"""
-        Preprocess DeepSpeed config.
-        """
-
-        if config is None:
-            config = self.state.get("deepspeed")
-        if config is None:
-            return {}
-        if isinstance(config, str):
-            config = NestedDict.load(config)
-        if config.get("steps_per_print", "auto") == "auto":
-            config["steps_per_print"] = self.print_interval
-        if config.get("train_micro_batch_size_per_gpu", "auto") == "auto":
-            config["train_micro_batch_size_per_gpu"] = self.batch_size
-        if "amp" in config:
-            amp = config["amp"]
-            if amp.get("enabled", "auto") == "auto":
-                amp["enabled"] = "true"
-            if amp.get("opt_level", "auto") == "auto":
-                amp["opt_level"] = "O1"
-        if "zero_optimization" in config:
-            zero = config["zero_optimization"]
-            if zero.get("allgather_bucket_size") == "auto":
-                zero["allgather_bucket_size"] = 1e6
-            if zero.get("reduce_bucket_size") == "auto":
-                zero["reduce_bucket_size"] = 1e6
-            if zero.get("stage3_max_live_parameters") == "auto":
-                zero["stage3_max_live_parameters"] = 1e8
-            if zero.get("stage3_max_live_gradients") == "auto":
-                zero["stage3_max_live_gradients"] = 1e8
-            if zero.get("stage3_max_reuse_distance") == "auto":
-                zero["stage3_max_reuse_distance"] = 1e8
-            if zero.get("stage3_prefetch_bucket_size") == "auto":
-                zero["stage3_prefetch_bucket_size"] = 1e6
-            if zero.get("stage3_param_persistence_threshold") == "auto":
-                zero["stage3_param_persistence_threshold"] = 1e8
-            if "amp" in config:
-                if "fp16" not in config:
-                    config["fp16"] = {}
-                if config["fp16"].get("enabled", "auto"):
-                    config["fp16"]["enabled"] = config["amp"]["enabled"]
-                warn(
-                    f"AMP is not compatible with ZeRO. Automatically set 'fp16' to {config['amp']['enabled']}",
-                    stacklevel=2,
-                )
-                del config["amp"]
-        if "optimizer" in config:
-            if "params" not in config["optimizer"]:
-                config["optimizer"]["params"] = {}
-            optimizer = config["optimizer"]["params"]
-            if optimizer.get("lr", "auto") == "auto":
-                optimizer["lr"] = self.state.get("optim.lr", 1e-3)
-            if optimizer.get("weight_decay", "auto") == "auto":
-                optimizer["weight_decay"] = self.state.get("optim.weight_decay", 1e-2)
-            if optimizer.get("betas") == "auto":
-                optimizer["betas"] = (0.9, 0.999)
-            if optimizer.get("eps") == "auto":
-                optimizer["eps"] = 1e-8
-        if "scheduler" in config:
-            if "params" not in config["scheduler"]:
-                config["scheduler"]["params"] = {}
-            scheduler = config["scheduler"]["params"]
-            if scheduler.get("total_num_steps", "auto") == "auto":
-                scheduler["total_num_steps"] = self.total_steps
-            if scheduler.get("warmup_num_steps", "auto") == "auto":
-                scheduler["warmup_num_steps"] = scheduler["total_num_steps"] // 20
-            if scheduler.get("warmup_max_lr", "auto") == "auto":
-                if self.optimizer:
-                    scheduler["warmup_max_lr"] = self.optimizer.param_groups[0]["lr"]
-                elif "optimizer" in config:
-                    scheduler["warmup_max_lr"] = config["optimizer"]["params"]["lr"]
-                else:
-                    raise ValueError("warmup_max_lr is not defined and cannot be inferred")
-            if scheduler.get("warmup_min_lr", "auto") == "auto":
-                scheduler["warmup_min_lr"] = 1e-7
-        return config
 
     @on_main_process
     def init_logging(self) -> None:
@@ -1106,9 +1056,7 @@ class BaseRunner(metaclass=RunnerMeta):
         result = NestedDict(result).clone()
         epochs = epochs or self.state.epochs
         epoch_end = epoch_end or self.state.epoch_end
-        repr_str = f"epoch [{epochs}/{epoch_end - 1}]\n" if epochs is not None and epoch_end else ""
-        repr_str += "\n".join([f"{k}:\t{self.format_result(v)}" for k, v in result.items()])
-        return repr_str
+        return "\n".join([f"{k}:\t{self.format_result(v)}" for k, v in result.items()])
 
     def format_result(self, result):
         return "\t".join([f"{k}: {v}" for k, v in result.items()])

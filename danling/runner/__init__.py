@@ -2,7 +2,7 @@ from . import defaults
 from .base_runner import BaseRunner
 from .runner_state import RunnerState
 from .torch_runner import TorchRunner
-from .utils import on_local_main_process, on_main_process
+from .utils import Precision, RunnerMode, on_local_main_process, on_main_process
 
 __all__ = [
     "RunnerState",
@@ -11,4 +11,6 @@ __all__ = [
     "on_main_process",
     "on_local_main_process",
     "defaults",
+    "RunnerMode",
+    "Precision",
 ]

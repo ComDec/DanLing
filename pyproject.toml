@@ -57,6 +57,7 @@ tensorflow = [
 ]
 torch = [
   "accelerate",
+  "deepspeed",
   "torch",
   "torcheval",
   "torchmetrics",

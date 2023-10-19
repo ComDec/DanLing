@@ -1,39 +1,48 @@
 from __future__ import annotations
 
-import os
 import random
 from collections.abc import Callable, Mapping
-from contextlib import suppress
+from contextlib import nullcontext
 from time import time
 from typing import Any
 from warnings import warn
 
+import deepspeed
 import torch
-from accelerate import Accelerator
-from accelerate.utils import DeepSpeedPlugin
 from chanfig import NestedDict
+from deepspeed import DeepSpeedEngine, comm
+from deepspeed.comm import ReduceOp
+from deepspeed.accelerator import get_accelerator
+from torch import Tensor
 from torch import distributed as dist
-from torch import nn, optim, utils
+from torch import nn, optim
 from torch.backends import cudnn
+from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
+
+try:
+    from functools import cached_property
+except ImportError:
+    from cached_property import cached_property  # type: ignore
 
 try:
     from numpy import random as np_random
 except ImportError:
     np_random = None
 
+from danling.data import DataLoader
 from danling.utils import catch
 
 from .base_runner import BaseRunner
-from .utils import on_main_process
+from .utils import Precision, on_main_process
 
 
 class TorchRunner(BaseRunner):
     r"""
     Set up everything for running a job.
 
-    `TorchRunner` uses [`accelerate`][accelerate] as distributed backend to
-    provide seamless distributed training experience.
+    `TorchRunner` uses [`deepspeed`][deepspeed] as distributed backend to
+    provide seamless experience for large-scale training.
 
     `TorchRunner` will automatically [`prepare`][accelerate.Accelerator.prepare] everything,
     including `model`, `criterion`, `optimizer`, `scheduler`, and `dataloaders` for distribute training,
@@ -43,21 +52,17 @@ class TorchRunner(BaseRunner):
     `datasets` and `TorchRunner` will create `dataloaders` for you.
     `TorchRunner` will inspect the `train` flag in corresponding dataset to
     automatically set `shuffle`.
-
-    Attributes:
-        accelerator (Accelerator):
-        accelerate: Arguments to pass when building accelerator. Defaults to `{}`.
     """
 
     # pylint: disable=R0902
 
-    accelerator: Accelerator
-    accelerate: dict
+    _model: nn.Module
+    _criterion: nn.Module
+    _optimizer: optim.Optimizer
+    _scheduler: optim.lr_scheduler.LRScheduler
 
-    model: nn.Module
-    criterion: nn.Module
-    optimizer: optim.Optimizer
-    scheduler: optim.lr_scheduler._LRScheduler
+    amp: Any = None
+    accelerator: Any = None
 
     def __init__(self, *args, **kwargs) -> None:
         if len(args) != 1 or kwargs:
@@ -73,37 +78,12 @@ class TorchRunner(BaseRunner):
             self.accelerate = {}
         self.accelerate.update(config.get("accelerate", {}))
         super().__init__(config)
+        self.accelerator = get_accelerator()
+        self.amp = self.accelerator.amp()
 
     def __post_init__(self, *args, **kwargs) -> None:
-        self._prepare()
-
-    def _prepare(self):
-        if self.datasets:
-            datasets = {k: d for k, d in self.datasets.items() if k not in self.dataloaders}
-            dataloader_kwargs = self.state.get("dataloader", {})
-            for k, d in datasets.items():
-                shuffle = dataloader_kwargs.shuffle if "shuffle" in dataloader_kwargs else getattr(d, "train", True)
-                self.dataloaders[k] = utils.data.DataLoader(d, shuffle=shuffle, **dataloader_kwargs)
-        objects = [self.model, self.criterion, self.optimizer, self.scheduler]
-        num_objects = len(objects)
-        dataloader_names = []
-        for name, dataloader in self.dataloaders.items():
-            dataloader_names.append(name)
-            objects.append(dataloader)
-        objects = self.prepare(*objects)
-        self.model, self.criterion, self.optimizer, self.scheduler = objects[:num_objects]
-        if len(objects) != len(dataloader_names) + num_objects:
-            raise ValueError("Number of dataloaders does not match.")
-        for name, dataloader in zip(dataloader_names, objects[num_objects:]):
-            self.dataloaders[name] = dataloader
-
-    @property
-    def deepspeed(self) -> dict | None:
-        if "accelerator" not in self:
-            raise ValueError("accelerator is not used")
-        if self.accelerator.state.deepspeed_plugin is not None:
-            return self.accelerator.state.deepspeed_plugin.deepspeed_config
-        return None
+        super().__post_init__()
+        self.initialize()
 
     def train(self, train_splits: list[str] | None = None, eval_splits: list[str] | None = None) -> NestedDict:
         r"""
@@ -125,12 +105,13 @@ class TorchRunner(BaseRunner):
         if eval_splits is None:
             eval_splits = [s for s in self.dataloaders if s not in train_splits]
         self.state.epoch_begin = self.state.epochs
-        print(f"Begin training from {self.state.epoch_begin} to {self.state.epoch_end}")
         print(f"Training splits: {train_splits}")
         print(f"Evaluation splits: {eval_splits}")
+        print(f"Begin training from epoch {self.state.epoch_begin} to epoch {self.state.epoch_end - 1}")
         patience = self.state.get("patience", float("inf"))
         for epochs in range(self.state.epoch_begin, self.state.epoch_end):  # type: ignore
             self.state.epochs = epochs
+            print(f"epoch [{epochs}/{self.state.epoch_end - 1}]")
             result = NestedDict()
             result.setattr("convert_mapping", True)
             for split in train_splits:
@@ -175,14 +156,14 @@ class TorchRunner(BaseRunner):
             loader.sampler.set_epoch(self.epochs)
 
         for iteration, data in enumerate(loader):
-            with self.autocast(), self.accumulate():
-                input = data["input"] if isinstance(data, Mapping) else data[0]
-                target = data["target"] if isinstance(data, Mapping) else data[1]
+            input = data["input"] if isinstance(data, Mapping) else data[0]
+            target = data["target"] if isinstance(data, Mapping) else data[1]
+            with self.autocast():
                 pred = self.model(**input) if isinstance(input, Mapping) else self.model(input)
                 loss = self.criterion(pred, target)
-                if self.metrics is not None:
-                    self.metrics.update(pred, target)
-                self.step(loss)
+            if self.metrics is not None:
+                self.metrics.update(pred, target)
+            self.step(loss)
 
             if self.print_interval > 0 and (
                 iteration > 0 and iteration % self.print_interval == 0 or iteration == length
@@ -193,6 +174,7 @@ class TorchRunner(BaseRunner):
                 self.meters.time.update((time() - batch_time) / interval)
                 batch_time = time()
                 reduced_loss = self.reduce(loss).item()
+                reduced_loss = loss.item()
                 self.meters.loss.update(reduced_loss)
                 self.step_log(split, iteration, length)
                 last_print_iteration = iteration
@@ -251,8 +233,9 @@ class TorchRunner(BaseRunner):
         for iteration, data in enumerate(loader):
             input = data["input"] if isinstance(data, Mapping) else data[0]
             target = data["target"] if isinstance(data, Mapping) else data[1]
-            pred = self.model(**input) if isinstance(input, Mapping) else self.model(input)
-            loss = self.criterion(pred, target)
+            with self.autocast():
+                pred = self.model(**input) if isinstance(input, Mapping) else self.model(input)
+                loss = self.criterion(pred, target)
             if self.metrics is not None:
                 self.metrics.update(pred, target)
 
@@ -265,6 +248,7 @@ class TorchRunner(BaseRunner):
                 self.meters.time.update((time() - batch_time) / interval)
                 batch_time = time()
                 reduced_loss = self.reduce(loss).item()
+                reduced_loss = loss.item()
                 self.meters.loss.update(reduced_loss)
                 self.step_log(split, iteration, length)
                 last_print_iteration = iteration
@@ -302,6 +286,91 @@ class TorchRunner(BaseRunner):
             output = self.gather_for_metrics(output)
         return output
 
+    def step(self, loss, batch_size: int | None = None, zero_grad: bool = True) -> None:
+        r"""
+        Backward loss and step optimizer & scheduler.
+
+        This method increment `self.state.steps`.
+
+        This method also increment `self.state.iters` when `batch_size` is specified.
+
+        Args:
+            zero_grad: Whether to zero the gradients.
+        """
+
+        self.model.backward(loss)
+        self.model.step()
+        # if self.sync_gradients:
+        #     if self.state.get("max_grad_value") is not None:
+        #         self.clip_grad_value_(self.model.parameters(), self.state.get("max_grad_value"))  # type: ignore
+        #     if self.state.get("max_grad_norm") is not None:
+        #         self.clip_grad_norm_(self.model.parameters(), self.state.get("max_grad_norm"))  # type: ignore
+        # if self.optimizer is not None:
+        #     self.optimizer.step()
+        #     if zero_grad:
+        #         self.optimizer.zero_grad()
+        # if self.scheduler is not None:
+        #     self.scheduler.step()
+        self.state.steps += 1
+        if batch_size is None:
+            batch_size = self.batch_size_equivalent
+        self.state.iters += batch_size
+        # TODO: Support `drop_last = False`
+        # self.state.iters += self.batch_size_equivalent
+
+    def backward(
+        self,
+        loss: Tensor,
+        allreduce_gradients: bool = True,
+        release_loss: bool = False,
+        retain_graph=False,
+        scale_wrt_gas: bool = True,
+    ):
+        r"""
+        Perform the backward pass to compute the gradients.
+        """
+
+        self.model.backward(
+            loss,
+            allreduce_gradients=allreduce_gradients,
+            release_loss=release_loss,
+            retain_graph=retain_graph,
+            scale_wrt_gas=scale_wrt_gas,
+        )
+
+    def reduce(self, tensor, op=ReduceOp.AVG, group=None, async_op=False):
+        if not self.distributed:
+            return tensor
+        comm.all_reduce(tensor, op=op, group=group, async_op=async_op)
+        return tensor
+
+    def initialize(self, **kwargs) -> None:
+        r"""
+        Prepare all objects passed in `args` for distributed training and mixed precision,
+        then return them in the same order.
+        """
+
+        self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
+            model=self.model,
+            optimizer=self.optimizer,
+            lr_scheduler=self.scheduler,
+            config=self.deepspeed,
+            dist_init_required=False,
+            **kwargs
+        )
+
+        if self.datasets:
+            datasets = {k: d for k, d in self.datasets.items() if k not in self.dataloaders}
+            dataloader_kwargs = self.state.setdefault("dataloader", self.state.empty())
+            for k, d in datasets.items():
+                dataloader_kwargs.setdefault("shuffle", getattr(d, "train", k == "train"))
+                dataloader_kwargs.setdefault("batch_size", self.batch_size)
+                self.dataloaders[k] = DataLoader(d, **dataloader_kwargs)
+        if self.dataloaders:
+            for d in self.dataloaders.values():
+                if hasattr(d, "device"):
+                    d.device = self.device
+
     def init_distributed(self) -> None:
         r"""
         Set up distributed training.
@@ -309,14 +378,14 @@ class TorchRunner(BaseRunner):
         Initialise process group and set up DDP variables.
         """
 
-        if os.environ.get("ACCELERATE_USE_DEEPSPEED", "false").lower() == "true":
-            deepspeed_config = self.state.get("deepspeed", os.environ.get("ACCELERATE_DEEPSPEED_CONFIG_FILE"))
-            self.accelerate["deepspeed_plugin"] = DeepSpeedPlugin(hf_ds_config=self.init_deepspeed(deepspeed_config))
-        self.accelerator = Accelerator(**self.accelerate)
-        if self.distributed:
-            object_list = [self.state.id]
-            dist.broadcast_object_list(object_list)
-            self.state.id = object_list[0]
+        dist_backend = "gloo"
+        if self.device != torch.device("cpu"):
+            torch.cuda.set_device(self.rank)
+            dist_backend = "nccl"
+        deepspeed.init_distributed(dist_backend=dist_backend, distributed_port=self.state.get("port", 29500))
+        object_list = [self.state.id]
+        dist.broadcast_object_list(object_list)
+        self.state.id = object_list[0]
 
     @on_main_process
     def init_tensorboard(self, *args, **kwargs) -> None:
@@ -370,37 +439,6 @@ class TorchRunner(BaseRunner):
         if torch.__version__ >= "1.8.0":
             torch.use_deterministic_algorithms(True)
 
-    def step(self, loss, batch_size: int | None = None, zero_grad: bool = True) -> None:
-        r"""
-        Backward loss and step optimizer & scheduler.
-
-        This method increment `self.state.steps`.
-
-        This method also increment `self.state.iters` when `batch_size` is specified.
-
-        Args:
-            zero_grad: Whether to zero the gradients.
-        """
-
-        self.accelerator.backward(loss)
-        if self.sync_gradients:
-            if self.state.get("max_grad_value") is not None:
-                self.clip_grad_value_(self.model.parameters(), self.state.get("max_grad_value"))  # type: ignore
-            if self.state.get("max_grad_norm") is not None:
-                self.clip_grad_norm_(self.model.parameters(), self.state.get("max_grad_norm"))  # type: ignore
-        if self.optimizer is not None:
-            self.optimizer.step()
-            if zero_grad:
-                self.optimizer.zero_grad()
-        if self.scheduler is not None:
-            self.scheduler.step()
-        self.state.steps += 1
-        if batch_size is None:
-            batch_size = self.batch_size_equivalent
-        self.state.iters += batch_size
-        # TODO: Support `drop_last = False`
-        # self.state.iters += self.batch_size_equivalent
-
     def state_dict(self, cls: Callable = dict) -> Mapping:
         r"""
         Return dict of all attributes for checkpoint.
@@ -408,7 +446,7 @@ class TorchRunner(BaseRunner):
 
         if self.model is None:
             raise ValueError("Model must be defined when calling state_dict")
-        model = self.accelerator.unwrap_model(self.model)
+        model = self.unwrap_model(self.model)
         return cls(
             runner=self.state.dict(),
             model=model.state_dict(),
@@ -416,54 +454,53 @@ class TorchRunner(BaseRunner):
             scheduler=self.scheduler.state_dict() if self.scheduler else None,
         )
 
-    def prepare(self, *args, device_placement: list[bool] | None = None) -> None:
+    def unwrap_model(self, model: nn.Module | None = None) -> nn.Module:
         r"""
-        Prepare all objects passed in `args` for distributed training and mixed precision,
-        then return them in the same order.
-        """
+        Unwrap model for saving checkpoints.
 
-        return self.accelerator.prepare(*args, device_placement=device_placement)
-
-    def accumulate(self, model: nn.Module | None = None):
-        r"""
-        Context manager that enables gradient accumulate.
+        Args:
+            model (Optional[nn.Module]): Model to unwrap.
+                Defaults to `self.model`.
         """
 
         model = model or self.model
-        return self.accelerator.accumulate(model)
 
-    def autocast(self):
+        while isinstance(model, (DeepSpeedEngine, DistributedDataParallel)):
+            model = model.module
+        return model
+
+    def autocast(self, enabled: bool = True, dtype: torch.dtype | str | None = None, cache_enabled: bool = True):
         r"""
         Context manager that enables auto-casting for the forward pass (and maybe backward pass).
         """
 
-        return self.accelerator.autocast()
+        if self.deepspeed.get("fp16.auto_cast"):
+            return nullcontext()
+        if dtype is None:
+            dtype = self.dtype
+        return self.amp.autocast(enabled, dtype, cache_enabled)
 
-    def backward(self, loss) -> None:
-        r"""
-        Backward loss to compute gradients.
-        """
+    @cached_property
+    def dtype(self) -> torch.dtype:
+        precision = self.state.get("precision", "notset")
+        if precision == "notset":
+            return torch.float32
+        if precision == "fp32":
+            return torch.float32
+        if precision == "bf16":
+            return torch.bfloat16
+        if precision == "fp16":
+            return torch.float16
+        if precision == "fp8":
+            raise ValueError("fp8 is not currently supported")
+            # return torch.float8
+        if precision == "int8":
+            return torch.int8
+        raise ValueError(
+            f"Precision should be one of 'fp32', 'bf16', 'fp16', 'fp8', 'int8', or 'notset, but got {precision}"
+        )
 
-        return self.accelerator.backward(loss)
-
-    def unwrap_model(self, model: nn.Module | None = None) -> nn.Module:
-        r"""
-        Unwrap DDP model.
-
-        Args:
-            model (Optional[nn.Module]):
-                Defaults to `self.model`.
-        """
-
-        if model is not None:
-            model = self.model
-        if self.accelerator is not None:
-            return self.accelerator.unwrap_model(model)
-        if self.distributed:
-            return model.module
-        return model
-
-    @property
+    @cached_property
     def batch_size(self) -> int:
         r"""
         Batch size.
@@ -476,7 +513,7 @@ class TorchRunner(BaseRunner):
             (int):
         """
 
-        batch_size = self.state.get("dataloader.batch_size")
+        batch_size = self.state.get("batch_size")
         if batch_size:
             return batch_size
         if self.dataloaders:
@@ -488,23 +525,14 @@ class TorchRunner(BaseRunner):
         raise AttributeError("batch_size could not be inferred, since no dataloader found.")
 
     @property
-    def accum_steps(self) -> int:
-        r"""
-        Gradient accumulation steps.
-
-        Returns:
-            (int):
-        """
-
-        return self.accelerator.gradient_accumulation_steps
-
-    @property
     def device(self) -> torch.device:  # pylint: disable=E1101
         r"""
         Device of runner.
         """
 
-        return self.accelerator.device
+        if torch.cuda.is_available():
+            return torch.device(self.accelerator.current_device_name())
+        return torch.device("cpu")
 
     @property
     def world_size(self) -> int:
@@ -512,7 +540,9 @@ class TorchRunner(BaseRunner):
         Number of Processes.
         """
 
-        return self.accelerator.num_processes
+        if dist.is_initialized():
+            return dist.get_world_size()
+        return super().world_size
 
     @property
     def rank(self) -> int:
@@ -520,33 +550,120 @@ class TorchRunner(BaseRunner):
         Process index in all processes.
         """
 
-        return self.accelerator.process_index
+        if dist.is_initialized():
+            return dist.get_rank()
+        return super().rank
 
-    @property
-    def local_rank(self) -> int:
-        r"""
-        Process index in local processes.
-        """
+    @cached_property
+    def deepspeed(self) -> dict:  # pylint: disable=R0912,R0915
+        deepspeed_config = self.state.setdefault("deepspeed", self.state.empty())
 
-        return self.accelerator.local_process_index
+        if self.state.zero is not None:
+            zero = deepspeed_config.setdefault("zero_optimization", {})
+            zero["stage"] = self.state.zero
+            if zero.get("allgather_partitions") == "auto":
+                zero["allgather_partitions"] = True
+            if zero.get("overlap_comm") == "auto":
+                zero["overlap_comm"] = True
+            if zero.get("reduce_scatter") == "auto":
+                zero["reduce_scatter"] = True
+            if zero.get("contiguous_gradients") == "auto":
+                zero["contiguous_gradients"] = True
+            if zero.get("allgather_bucket_size") == "auto":
+                zero["allgather_bucket_size"] = 1e6
+            if zero.get("reduce_bucket_size") == "auto":
+                zero["reduce_bucket_size"] = 1e6
+            if zero.get("stage3_max_live_parameters") == "auto":
+                zero["stage3_max_live_parameters"] = 1e8
+            if zero.get("stage3_max_live_gradients") == "auto":
+                zero["stage3_max_live_gradients"] = 1e8
+            if zero.get("stage3_max_reuse_distance") == "auto":
+                zero["stage3_max_reuse_distance"] = 1e8
+            if zero.get("stage3_prefetch_bucket_size") == "auto":
+                zero["stage3_prefetch_bucket_size"] = 1e6
+            if zero.get("stage3_param_persistence_threshold") == "auto":
+                zero["stage3_param_persistence_threshold"] = 1e8
 
-    def gather(self, tensor) -> torch.Tensor:
-        r"""
-        Gather tensor.
-        """
+        if self.state.amp is not None:
+            amp = deepspeed_config.setdefault("amp", {})
+            if amp.get("enabled", "auto") == "auto":
+                amp["enabled"] = True
+            if amp.get("opt_level", "auto") == "auto":
+                amp["opt_level"] = self.state.amp
 
-        return self.accelerator.gather(tensor)
+        if self.state.precision == "bf16":
+            bf16 = deepspeed_config.setdefault("bf16", {})
+            if bf16.get("enabled", "auto") == "auto":
+                bf16["enabled"] = True
+        elif self.state.precision == "fp16":
+            fp16 = deepspeed_config.setdefault("fp16", {})
+            if fp16.get("enabled", "auto") == "auto":
+                fp16["enabled"] = True
 
-    def reduce(self, tensor, reduction: str = "sum") -> torch.Tensor:
-        r"""
-        Reduce tensor.
-        """
+        if deepspeed_config.get("bf16.enabled", False):
+            if self.state.precision == "notset":
+                self.state.precision = Precision.bf16
+            elif self.state.precision != "bf16":
+                raise ValueError(
+                    f"Precision is {self.state.precision} in state, which differs from bf16 in deepspeed config"
+                )
+        if deepspeed_config.get("fp16.enabled", False):
+            if self.state.precision == "notset":
+                self.state.precision = Precision.fp16
+            elif self.state.precision != "fp16":
+                raise ValueError(
+                    f"Precision is {self.state.precision} in state, which differs from fp16 in deepspeed config"
+                )
 
-        return self.accelerator.reduce(tensor, reduction=reduction)
+        if self.state.accum_steps > 1:
+            deepspeed_config["gradient_accumulation_steps"] = self.state.accum_steps
+        elif "gradient_accumulation_steps" in deepspeed_config:
+            self.state.accum_steps = deepspeed_config["gradient_accumulation_steps"]
 
-    def __getattr__(self, name: str) -> Any:
-        with suppress(AttributeError):
-            return super().__getattr__(name)
-        if "accelerator" in self.__dict__ and hasattr(self.accelerator, name):
-            return getattr(self.accelerator, name)
-        raise super().__getattribute__(name)
+        if "optimizer" in deepspeed_config:
+            if "params" not in deepspeed_config["optimizer"]:
+                deepspeed_config["optimizer"]["params"] = {}
+            optimizer = deepspeed_config["optimizer"]["params"]
+            if optimizer.get("lr", "auto") == "auto":
+                optimizer["lr"] = self.state.get("optim.lr", 1e-3)
+            if optimizer.get("weight_decay", "auto") == "auto":
+                optimizer["weight_decay"] = self.state.get("optim.weight_decay", 1e-2)
+            if optimizer.get("betas") == "auto":
+                optimizer["betas"] = (0.9, 0.999)
+            if optimizer.get("eps") == "auto":
+                optimizer["eps"] = 1e-8
+        if "scheduler" in deepspeed_config:
+            if "params" not in deepspeed_config["scheduler"]:
+                deepspeed_config["scheduler"]["params"] = {}
+            scheduler = deepspeed_config["scheduler"]["params"]
+            if scheduler.get("total_num_steps", "auto") == "auto":
+                scheduler["total_num_steps"] = self.total_steps
+            if scheduler.get("warmup_num_steps", "auto") == "auto":
+                scheduler["warmup_num_steps"] = scheduler["total_num_steps"] // 20
+            if scheduler.get("warmup_max_lr", "auto") == "auto":
+                if self.optimizer:
+                    scheduler["warmup_max_lr"] = self.optimizer.param_groups[0]["lr"]
+                elif "optimizer" in deepspeed_config:
+                    scheduler["warmup_max_lr"] = deepspeed_config["optimizer"]["params"]["lr"]
+                else:
+                    raise ValueError("warmup_max_lr is not defined and cannot be inferred")
+            if scheduler.get("warmup_min_lr", "auto") == "auto":
+                scheduler["warmup_min_lr"] = 1e-7
+        if deepspeed_config.get("steps_per_print", "auto") == "auto":
+            deepspeed_config["steps_per_print"] = self.print_interval
+        if deepspeed_config.get("train_micro_batch_size_per_gpu", "auto") == "auto":
+            deepspeed_config["train_micro_batch_size_per_gpu"] = self.state.batch_size
+        return deepspeed_config
+
+    # def __setattr__(self, name, value):
+    #     if name not in ("model", "criterion") and isinstance(value, nn.Module):
+    #         if is_criterion(value):
+    #             self.criterion = value
+    #         else:
+    #             self.model = value
+    #     elif name != "optimizer" and isinstance(value, optim.Optimizer):
+    #         self.optimizer = value
+    #     elif name != "scheduler" and isinstance(value, optim.lr_scheduler.LRScheduler):
+    #         self.scheduler = value
+
+    #     super().__setattr__(name, value)

@@ -1,5 +1,6 @@
 from danling import metrics, modules, optim, registry, runner, tensors, typing, utils
 
+from .data import DataLoader
 from .metrics import (
     AverageMeter,
     AverageMeters,
@@ -25,6 +26,7 @@ __all__ = [
     "typing",
     "BaseRunner",
     "TorchRunner",
+    "DataLoader",
     "Registry",
     "GlobalRegistry",
     "Metrics",

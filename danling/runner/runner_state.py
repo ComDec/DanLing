@@ -21,6 +21,7 @@ except ImportError:
 from danling.utils import base62
 
 from . import defaults
+from .utils import Precision
 
 
 class RunnerState(NestedDict):
@@ -35,7 +36,7 @@ class RunnerState(NestedDict):
 
     Since `RunnerState` is a `NestedDict`, you can access its attributes by `state["key"]` or `state.key`.
 
-    Attributes: General:
+    Attributes: ID:
         id (str): `f"{time_str}{self.experiment_id:.5}{self.run_id:.4}"`.
         uuid (UUID, property): `uuid5(self.run_id, self.id)`.
         name (str): `f"{self.experiment_name}-{self.run_name}"`.
@@ -48,9 +49,17 @@ class RunnerState(NestedDict):
             Defaults to `UUID('78787878-7878-7878-7878-787878787878')`
             if Runner not under a git repo or git/gitpython not installed.
         experiment_name (str): Defaults to `"DanLing"`.
+
+    Attributes: General:
         seed (int): Defaults to `randint(0, 2**32 - 1)`.
         deterministic (bool): Ensure [deterministic](https://pytorch.org/docs/stable/notes/randomness.html) operations.
             Defaults to `False`.
+
+    Attributes: Precision:
+        precision (str | None): The floating-point precision for computation. Mutually exclusive with `amp`.
+            Defaults to `None`.
+        amp (str | None): The optimisation level of Automatic Mixed Precision. Mutually exclusive with `precision`.
+            Defaults to `None`.
 
     Attributes: Progress:
         iters (int): The number of data samples processed.
@@ -137,6 +146,13 @@ class RunnerState(NestedDict):
     seed: int
     deterministic: bool = False
 
+    precision: Precision = Precision.notset
+    amp = None
+    zero = None
+
+    batch_size: int
+    accum_steps: int = 1
+
     iters: int = 0
     steps: int = 0
     epochs: int = 0
@@ -178,6 +194,11 @@ class RunnerState(NestedDict):
         self.id = f"{self.get_time_str()}{self.experiment_id:.5}{self.run_id:.4}"  # pylint: disable=C0103
         self.name = f"{self.experiment_name}-{self.run_name}"
         self.setattr("ignored_keys_in_hash", defaults.DEFAULT_IGNORED_KEYS_IN_HASH)
+
+    def validate(self):
+        super().validate()
+        if self.precision is not None and self.amp is not None:
+            raise ValueError(f"precision={self.precision} is mutually exclusive with amp={self.amp}")
 
     # staticmethod is not recognised by `callable` in earlier python
     def get_experiment_id(self) -> str:
