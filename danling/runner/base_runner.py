@@ -546,7 +546,7 @@ class BaseRunner(metaclass=RunnerMeta):  # pylint: disable=too-many-public-metho
 
         if "dir" in self.state:
             return self.state.dir
-        return os.path.join(self.project_root, f"{self.name}-{self.id}")
+        return os.path.join(self.project_root, f"{self.name}-{self.id}", self.time)
 
     @cached_property
     def log_path(self) -> str:
