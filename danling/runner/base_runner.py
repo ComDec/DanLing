@@ -89,7 +89,7 @@ class BaseRunner(metaclass=RunnerMeta):  # pylint: disable=too-many-public-metho
 
     Attributes: IO:
         dir (str, property): Directory of the run.
-            Defaults to `${self.project_root}/${self.name}-${self.experiment_id}/${self.timestamp})`.
+            Defaults to `${self.project_root}/${self.name}-${self.id}/${self.timestamp})`.
         checkpoint_dir (str, property): Directory of checkpoints.
         log_path (str, property):  Path of log file.
         checkpoint_dir_name (str): The name of the directory under `runner.dir` to save checkpoints.
@@ -540,7 +540,7 @@ class BaseRunner(metaclass=RunnerMeta):  # pylint: disable=too-many-public-metho
 
         if "dir" in self.state:
             return self.state.dir
-        return os.path.join(self.project_root, f"{self.name}-{self.experiment_id:.8}", self.timestamp)
+        return os.path.join(self.project_root, f"{self.name}-{self.id}", self.timestamp)
 
     @cached_property
     def log_path(self) -> str:
