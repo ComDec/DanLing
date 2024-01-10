@@ -151,13 +151,13 @@ class BaseRunner(metaclass=RunnerMeta):  # pylint: disable=too-many-public-metho
             self.set_seed()
         if self.state.deterministic:
             self.set_deterministic()
-        if os.listdir(self.dir):
-            warn(
-                f"Directory `{self.dir}` is not empty.",
-                category=RuntimeWarning,
-                stacklevel=2,
-            )
         if self.state.log:
+            if os.listdir(self.dir):
+                warn(
+                    f"Directory `{self.dir}` is not empty.",
+                    category=RuntimeWarning,
+                    stacklevel=2,
+                )
             self.init_logging()
         self.init_print()
         if self.state.tensorboard:
